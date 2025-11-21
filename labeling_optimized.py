@@ -7,7 +7,11 @@ import argparse
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
+
+# .env 파일에서 환경변수 로드
+load_dotenv()
 from tqdm.asyncio import tqdm_asyncio
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 from openai import RateLimitError, APITimeoutError, APIConnectionError
