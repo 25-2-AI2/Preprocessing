@@ -125,21 +125,33 @@ def save_checkpoint(checkpoint_path: Path, last_batch: int, all_labels: list, co
 
 
 def save_intermediate(intermediate_path: Path, df_original: pd.DataFrame, all_labels: list):
-    """중간 결과 저장 (Parquet)"""
+    """중간 결과 저장 (Parquet) - 임시 파일 사용으로 안전한 저장"""
     intermediate_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # None이 아닌 라벨만 있는 행 확인
     valid_indices = [i for i, label in enumerate(all_labels) if label is not None]
-    
+
     if not valid_indices:
         return
-    
+
     # 유효한 라벨로 DataFrame 생성
     labels_df = pd.DataFrame([all_labels[i] if all_labels[i] else {} for i in range(len(all_labels))])
     df_partial = pd.concat([df_original.reset_index(drop=True), labels_df.reset_index(drop=True)], axis=1)
-    
-    df_partial.to_parquet(intermediate_path, index=False)
-    print(f"  💾 중간 저장 완료: {len(valid_indices)}/{len(all_labels)} 리뷰 처리됨")
+
+    # 임시 파일에 먼저 저장 후 rename (원자적 파일 쓰기)
+    temp_path = intermediate_path.parent / f".tmp_{intermediate_path.name}"
+    try:
+        df_partial.to_parquet(temp_path, index=False)
+        # 기존 파일 삭제 후 rename
+        if intermediate_path.exists():
+            intermediate_path.unlink()
+        temp_path.rename(intermediate_path)
+        print(f"  💾 중간 저장 완료: {len(valid_indices)}/{len(all_labels)} 리뷰 처리됨")
+    except Exception as e:
+        # 임시 파일 정리
+        if temp_path.exists():
+            temp_path.unlink()
+        raise e
 
 
 def cleanup_checkpoint(checkpoint_path: Path):
@@ -226,7 +238,10 @@ async def main_async(input_file: str):
     print("=" * 60)
     print("🚀 리뷰 라벨링 시작")
     print("=" * 60)
-    
+
+    # 체크포인트 디렉토리 미리 생성
+    Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+
     # 경로 설정
     paths = get_paths(input_file)
     
@@ -309,16 +324,22 @@ async def main_async(input_file: str):
         )
     except KeyboardInterrupt:
         print("\n⚠ 중단됨! 현재까지 결과 저장 중...")
-        save_checkpoint(paths['checkpoint'], max(completed_batches) if completed_batches else 0, all_labels, completed_batches)
-        save_intermediate(paths['intermediate'], df, all_labels)
-        print("✓ 저장 완료. 다시 실행하면 이어서 진행됩니다.")
+        try:
+            save_checkpoint(paths['checkpoint'], max(completed_batches) if completed_batches else 0, all_labels, completed_batches)
+            save_intermediate(paths['intermediate'], df, all_labels)
+            print("✓ 저장 완료. 다시 실행하면 이어서 진행됩니다.")
+        except Exception as save_err:
+            print(f"⚠ 저장 중 오류 발생: {save_err}")
         return
     except Exception as e:
         print(f"\n❌ 오류 발생: {e}")
         print("현재까지 결과 저장 중...")
-        save_checkpoint(paths['checkpoint'], max(completed_batches) if completed_batches else 0, all_labels, completed_batches)
-        save_intermediate(paths['intermediate'], df, all_labels)
-        print("✓ 저장 완료. 다시 실행하면 이어서 진행됩니다.")
+        try:
+            save_checkpoint(paths['checkpoint'], max(completed_batches) if completed_batches else 0, all_labels, completed_batches)
+            save_intermediate(paths['intermediate'], df, all_labels)
+            print("✓ 저장 완료. 다시 실행하면 이어서 진행됩니다.")
+        except Exception as save_err:
+            print(f"⚠ 저장 중 오류 발생: {save_err}")
         raise
     
     # 최종 결과 저장

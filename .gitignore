@@ -67,6 +67,8 @@ venv.bak/
 # Data files
 json_data/
 parquet_data/
+label_data/
+
 
 # OS files
 .DS_Store
@@ -74,3 +76,5 @@ Thumbs.db
 
 # Logs
 *.log
+log.txt
+
