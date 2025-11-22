@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import math
@@ -209,7 +210,10 @@ async def label_batch_async(
             if content.startswith("json"):
                 content = content[4:]
         content = content.strip()
-        
+
+        # JSON 표준에서 허용하지 않는 +숫자 패턴 수정 (예: +1 -> 1, +2 -> 2)
+        content = re.sub(r':\s*\+(\d)', r': \1', content)
+
         data_list = json.loads(content)
         
         if not isinstance(data_list, list) or len(data_list) != len(texts):
@@ -224,10 +228,104 @@ async def label_batch_async(
     
     except json.JSONDecodeError as e:
         print(f"  ❌ [배치 {batch_idx}] JSON 파싱 오류: {e}")
+        print(f"     원본 응답 (처음 500자): {content[:500]}")
         return [None] * len(texts)
     except Exception as e:
         print(f"  ❌ [배치 {batch_idx}] 오류: {e}")
         return [None] * len(texts)
+
+
+# ============================================================
+# 실패한 항목 재처리
+# ============================================================
+
+RETRY_BATCH_SIZE = 10  # 재처리 시 더 작은 배치 크기
+RETRY_MAX_ATTEMPTS = 3  # 최대 재처리 시도 횟수
+
+
+async def retry_failed_labels(
+    texts: list,
+    all_labels: list,
+    sem: asyncio.Semaphore,
+    retry_batch_size: int = RETRY_BATCH_SIZE,
+    max_attempts: int = RETRY_MAX_ATTEMPTS
+) -> list:
+    """
+    실패한(None) 라벨들을 작은 배치로 재처리
+
+    Args:
+        texts: 전체 텍스트 리스트
+        all_labels: 전체 라벨 리스트 (None 포함)
+        sem: 세마포어
+        retry_batch_size: 재처리 배치 크기 (기본값: 10)
+        max_attempts: 최대 재처리 시도 횟수 (기본값: 3)
+
+    Returns:
+        재처리된 라벨 리스트
+    """
+    for attempt in range(1, max_attempts + 1):
+        # 실패한 인덱스 찾기
+        failed_indices = [i for i, label in enumerate(all_labels) if label is None]
+
+        if not failed_indices:
+            print("  ✓ 모든 라벨링 성공!")
+            break
+
+        print(f"\n🔄 재처리 시도 {attempt}/{max_attempts}")
+        print(f"   - 실패 항목: {len(failed_indices)}개")
+        print(f"   - 배치 크기: {retry_batch_size}")
+
+        # 실패한 항목들을 작은 배치로 나누기
+        retry_batches = []
+        for i in range(0, len(failed_indices), retry_batch_size):
+            batch_indices = failed_indices[i:i + retry_batch_size]
+            retry_batches.append(batch_indices)
+
+        print(f"   - 재처리 배치: {len(retry_batches)}개")
+
+        # 재처리 진행
+        retry_success = 0
+        retry_fail = 0
+
+        async def retry_single_batch(batch_indices: list, batch_num: int):
+            nonlocal retry_success, retry_fail
+
+            batch_texts = [texts[idx] for idx in batch_indices]
+            labels = await label_batch_async(batch_texts, f"retry_{batch_num}", sem)
+
+            # 결과 업데이트
+            for idx, label in zip(batch_indices, labels):
+                if label is not None:
+                    all_labels[idx] = label
+                    retry_success += 1
+                else:
+                    retry_fail += 1
+
+        # 재처리 배치 실행
+        retry_tasks = [
+            retry_single_batch(batch_indices, i)
+            for i, batch_indices in enumerate(retry_batches)
+        ]
+
+        await tqdm_asyncio.gather(
+            *retry_tasks,
+            desc=f"재처리 {attempt}차",
+            total=len(retry_batches),
+            unit="batch"
+        )
+
+        print(f"   - 재처리 결과: 성공 {retry_success}, 실패 {retry_fail}")
+
+        # 모두 성공하면 종료
+        remaining_failed = sum(1 for label in all_labels if label is None)
+        if remaining_failed == 0:
+            print("  ✓ 재처리 완료! 모든 항목 성공")
+            break
+
+        # 다음 시도를 위해 배치 크기 더 줄이기
+        retry_batch_size = max(1, retry_batch_size // 2)
+
+    return all_labels
 
 
 # ============================================================
@@ -342,11 +440,20 @@ async def main_async(input_file: str):
             print(f"⚠ 저장 중 오류 발생: {save_err}")
         raise
     
+    # 실패한 항목 재처리
+    failed_count = sum(1 for label in all_labels if label is None)
+    if failed_count > 0:
+        print("-" * 60)
+        print(f"⚠ {failed_count}개 항목 라벨링 실패 - 재처리 시작")
+        all_labels = await retry_failed_labels(texts, all_labels, sem)
+
     # 최종 결과 저장
     print("-" * 60)
     print("💾 최종 결과 저장 중...")
-    
-    labels_df = pd.DataFrame(all_labels)
+
+    # 재처리 후에도 실패한 항목은 빈 딕셔너리로 대체
+    final_labels = [label if label is not None else {} for label in all_labels]
+    labels_df = pd.DataFrame(final_labels)
     df_labeled = pd.concat([df.reset_index(drop=True), labels_df.reset_index(drop=True)], axis=1)
     
     # Parquet 저장
